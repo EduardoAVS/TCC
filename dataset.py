@@ -6,6 +6,7 @@ from PIL import Image
 import cv2
 from tqdm import tqdm
 import helper as hf
+from typing import List, Optional, Tuple
 
 class GANData(Dataset):
     def __init__(self, root, mode='train',transform=None):
@@ -165,6 +166,101 @@ class VAEData(Dataset):
         sample = next_frame
         cap.release()
         return sample
+
+
+class SimpleFrameDataset(Dataset):
+    def __init__(
+        self,
+        root,
+        mode='train',
+        transform=None,
+        frame_stride=15,
+        max_frames_per_video=32,
+        video_limit: Optional[int] = None,
+    ):
+        self.root = root
+        self.mode = mode
+        self.transform = transform
+        self.frame_stride = frame_stride
+        self.max_frames_per_video = max_frames_per_video
+        self.video_limit = video_limit
+        self.samples: List[Tuple[str, int, int, int]] = []
+        self.key_frames = self._load_key_frames()
+        self._build_index()
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        video_path, frame_index, label, video_index = self.samples[idx]
+        image = self._read_frame(video_path, frame_index)
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, torch.tensor(label, dtype=torch.long), video_index, frame_index
+
+    def _load_key_frames(self):
+        appendix_path = os.path.join(self.root, "Appendix.txt")
+        if not os.path.exists(appendix_path):
+            return {}
+        return hf.get_key_frames(self.root)
+
+    def _build_index(self):
+        mode_dir = os.path.join(self.root, self.mode)
+        if not os.path.isdir(mode_dir):
+            raise ValueError("dataset directory not found: {}".format(mode_dir))
+
+        files = sorted(
+            file_name for file_name in os.listdir(mode_dir)
+            if file_name.lower().endswith(".mp4")
+        )
+        if self.video_limit is not None:
+            files = files[:self.video_limit]
+
+        for file_name in files:
+            video_index = int(os.path.splitext(file_name)[0])
+            label = 1 if video_index < 400 else 0
+            video_path = os.path.join(mode_dir, file_name)
+            frame_indices = self._sample_frame_indices(video_path, video_index, label)
+            for frame_index in frame_indices:
+                self.samples.append((video_path, frame_index, label, video_index))
+
+    def _sample_frame_indices(self, video_path, video_index, label):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError("can't open：{}".format(video_path))
+
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+
+        if frame_count <= 0:
+            return []
+
+        max_frame = frame_count - 1
+        if self.mode == "train" and label == 1 and video_index in self.key_frames:
+            # Keep positive training samples mostly before the annotated accident frame.
+            max_frame = min(max_frame, max(self.key_frames[video_index] - 1, 0))
+
+        frame_indices = list(range(0, max_frame + 1, self.frame_stride))
+        if not frame_indices:
+            frame_indices = [0]
+
+        if self.max_frames_per_video and len(frame_indices) > self.max_frames_per_video:
+            positions = torch.linspace(0, len(frame_indices) - 1, steps=self.max_frames_per_video)
+            frame_indices = [frame_indices[int(pos.item())] for pos in positions]
+
+        return frame_indices
+
+    def _read_frame(self, video_path, frame_index):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError("can't open：{}".format(video_path))
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            raise ValueError("can't open：{} {}".format(video_path, frame_index))
+        return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
 if __name__ == "__main__":
     # print(0)
