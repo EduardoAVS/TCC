@@ -1,9 +1,15 @@
 import argparse
+import csv
 import os
 from dataclasses import dataclass
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import confusion_matrix
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
@@ -43,6 +49,16 @@ class Metrics:
     accuracy: float
     precision: float
     recall: float
+    f1_score: float
+    auc: float
+    fpr: float
+
+
+@dataclass
+class EpochResult:
+    metrics: Metrics
+    labels: list
+    preds: list
 
 
 def build_transforms(image_size):
@@ -53,12 +69,75 @@ def build_transforms(image_size):
     ])
 
 
-def compute_metrics(total_loss, total_samples, tp, fp, fn, correct):
-    precision = tp / (tp + fp) if (tp + fp) else 0.0
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    accuracy = correct / total_samples if total_samples else 0.0
+def compute_metrics(total_loss, total_samples, labels, preds, positive_scores):
     loss = total_loss / total_samples if total_samples else 0.0
-    return Metrics(loss=loss, accuracy=accuracy, precision=precision, recall=recall)
+    accuracy = float(accuracy_score(labels, preds))
+    precision = float(precision_score(labels, preds, zero_division=0))
+    recall = float(recall_score(labels, preds, zero_division=0))
+    f1 = float(f1_score(labels, preds, zero_division=0))
+    try:
+        auc = float(roc_auc_score(labels, positive_scores))
+    except ValueError:
+        auc = float("nan")
+
+    tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+    fpr = fp / (fp + tn) if (fp + tn) else 0.0
+    return Metrics(
+        loss=loss,
+        accuracy=accuracy,
+        precision=precision,
+        recall=recall,
+        f1_score=f1,
+        auc=auc,
+        fpr=fpr,
+    )
+
+
+def write_metrics_table(output_path, rows):
+    fieldnames = ["epoch", "split", "loss", "accuracy", "precision", "recall", "f1_score", "auc", "fpr"]
+    with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def save_loss_curve(output_path, train_losses, test_losses):
+    plt.figure(figsize=(8, 5))
+    epochs = range(1, len(train_losses) + 1)
+    plt.plot(epochs, train_losses, marker="o", label="train loss")
+    plt.plot(epochs, test_losses, marker="o", label="test loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Train/Test Loss Curve")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
+def save_confusion_matrix(output_path, labels, preds):
+    cm = confusion_matrix(labels, preds, labels=[0, 1])
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cm, interpolation="nearest", cmap="Blues")
+    plt.title("Confusion Matrix")
+    plt.colorbar()
+    tick_labels = ["negative", "positive"]
+    tick_marks = [0, 1]
+    plt.xticks(tick_marks, tick_labels)
+    plt.yticks(tick_marks, tick_labels)
+    plt.xlabel("Predicted label")
+    plt.ylabel("True label")
+
+    threshold = cm.max() / 2 if cm.size else 0.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            color = "white" if cm[i, j] > threshold else "black"
+            plt.text(j, i, str(cm[i, j]), ha="center", va="center", color=color)
+
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
 
 
 def run_epoch(model, loader, criterion, device, optimizer=None):
@@ -67,10 +146,9 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
 
     total_loss = 0.0
     total_samples = 0
-    correct = 0
-    tp = 0
-    fp = 0
-    fn = 0
+    labels_list = []
+    preds_list = []
+    positive_scores = []
 
     for images, labels, _, _ in loader:
         images = images.to(device)
@@ -85,15 +163,16 @@ def run_epoch(model, loader, criterion, device, optimizer=None):
                 optimizer.step()
 
         preds = logits.argmax(dim=1)
+        probs = torch.softmax(logits, dim=1)[:, 1]
         batch_size = labels.size(0)
         total_loss += loss.item() * batch_size
         total_samples += batch_size
-        correct += (preds == labels).sum().item()
-        tp += ((preds == 1) & (labels == 1)).sum().item()
-        fp += ((preds == 1) & (labels == 0)).sum().item()
-        fn += ((preds == 0) & (labels == 1)).sum().item()
+        labels_list.extend(labels.detach().cpu().tolist())
+        preds_list.extend(preds.detach().cpu().tolist())
+        positive_scores.extend(probs.detach().cpu().tolist())
 
-    return compute_metrics(total_loss, total_samples, tp, fp, fn, correct)
+    metrics = compute_metrics(total_loss, total_samples, labels_list, preds_list, positive_scores)
+    return EpochResult(metrics=metrics, labels=labels_list, preds=preds_list)
 
 
 def main():
@@ -156,22 +235,67 @@ def main():
     print("test samples:", len(test_dataset))
 
     best_acc = -1.0
+    metrics_rows = []
+    train_losses = []
+    test_losses = []
+    metrics_path = os.path.join(args.output_dir, "metrics_table.csv")
+    loss_curve_path = os.path.join(args.output_dir, "loss_curve.png")
+    confusion_matrix_path = os.path.join(args.output_dir, "confusion_matrix.png")
+
     for epoch in range(1, args.epochs + 1):
-        train_metrics = run_epoch(model, train_loader, criterion, device, optimizer=optimizer)
-        eval_metrics = run_epoch(model, test_loader, criterion, device)
+        train_result = run_epoch(model, train_loader, criterion, device, optimizer=optimizer)
+        eval_result = run_epoch(model, test_loader, criterion, device)
+        train_metrics = train_result.metrics
+        eval_metrics = eval_result.metrics
+        train_losses.append(train_metrics.loss)
+        test_losses.append(eval_metrics.loss)
+        metrics_rows.extend([
+            {
+                "epoch": epoch,
+                "split": "train",
+                "loss": train_metrics.loss,
+                "accuracy": train_metrics.accuracy,
+                "precision": train_metrics.precision,
+                "recall": train_metrics.recall,
+                "f1_score": train_metrics.f1_score,
+                "auc": train_metrics.auc,
+                "fpr": train_metrics.fpr,
+            },
+            {
+                "epoch": epoch,
+                "split": "test",
+                "loss": eval_metrics.loss,
+                "accuracy": eval_metrics.accuracy,
+                "precision": eval_metrics.precision,
+                "recall": eval_metrics.recall,
+                "f1_score": eval_metrics.f1_score,
+                "auc": eval_metrics.auc,
+                "fpr": eval_metrics.fpr,
+            },
+        ])
+        write_metrics_table(metrics_path, metrics_rows)
+        save_loss_curve(loss_curve_path, train_losses, test_losses)
+        save_confusion_matrix(confusion_matrix_path, eval_result.labels, eval_result.preds)
         print(
-            "epoch {}/{} | train loss {:.4f} acc {:.4f} prec {:.4f} rec {:.4f} | "
-            "test loss {:.4f} acc {:.4f} prec {:.4f} rec {:.4f}".format(
+            "epoch {}/{} | "
+            "train loss {:.4f} acc {:.4f} prec {:.4f} rec {:.4f} f1 {:.4f} auc {:.4f} fpr {:.4f} | "
+            "test loss {:.4f} acc {:.4f} prec {:.4f} rec {:.4f} f1 {:.4f} auc {:.4f} fpr {:.4f}".format(
                 epoch,
                 args.epochs,
                 train_metrics.loss,
                 train_metrics.accuracy,
                 train_metrics.precision,
                 train_metrics.recall,
+                train_metrics.f1_score,
+                train_metrics.auc,
+                train_metrics.fpr,
                 eval_metrics.loss,
                 eval_metrics.accuracy,
                 eval_metrics.precision,
                 eval_metrics.recall,
+                eval_metrics.f1_score,
+                eval_metrics.auc,
+                eval_metrics.fpr,
             )
         )
 
@@ -185,6 +309,10 @@ def main():
                 },
                 os.path.join(args.output_dir, "best.pt"),
             )
+
+    print("metrics table saved to:", metrics_path)
+    print("loss curve saved to:", loss_curve_path)
+    print("confusion matrix saved to:", confusion_matrix_path)
 
 
 if __name__ == "__main__":
